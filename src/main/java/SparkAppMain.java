@@ -1,3 +1,4 @@
+import org.apache.commons.math3.distribution.ChiSquaredDistribution;
 import org.apache.commons.math3.stat.correlation.Covariance;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.sql.Dataset;
@@ -174,22 +175,27 @@ public class SparkAppMain {
     public static double trialReturn(List<Double> trial, List<List<Double>> instruments) {
        // printNestedDoubleList(instruments);
         //System.out.println("------------------------TRIAL RETURN-----------------------------");
-        double totalReturn = 0.0;
+        double totalReturn = 0.0; int size = 0;
         for(List<Double> instrument : instruments) {
-            double itr = instrumentTrialReturn(instrument, trial);
-          //  System.out.println(itr);
-            if(!Double.isNaN(itr))
-                totalReturn += itr;
+            totalReturn+= instrumentTrialReturn(instrument, trial);
         }
 //        System.out.println(totalReturn);
+        //if(instruments.size()==0) System.out.println("----------------ZERO----------------------");
+
         return totalReturn/instruments.size();
     }
     public static double instrumentTrialReturn(List<Double> instrument, List<Double> trial) {
-       // System.out.println("------------------------INSTRUMENT TRIAL RETURN-----------------------------");
-        double itr = instrument.get(0);
+//       System.out.println("------------------------INSTRUMENT TRIAL RETURN-----------------------------");
+        double itr = 0.0;
+       if(!Double.isNaN(instrument.get(0))) itr = instrument.get(0);
         int i=0;
         while (i<trial.size()) {
-            itr += trial.get(i) * instrument.get(i+1);
+            double t_el = trial.get(i), i_el = instrument.get(i+1);
+            if(!Double.isNaN(t_el) && !Double.isNaN(i_el)) {
+                //System.out.println(itr);
+                itr += trial.get(i) * instrument.get(i+1);
+//                System.out.println(itr);
+            }
             ++i;
         }
         //System.out.println(itr);
@@ -226,31 +232,82 @@ public class SparkAppMain {
 //        for(long seed: seeds){
 //            trialReturns(seed, numTrials/parallelism, factorWeights, factorMeans, factorCov, spark);
 //        }
-      return seedsDS.flatMap((Long seed) -> trialReturns(seed, 10000, factorWeights, factorMeans, factorCov, spark).iterator(), Encoders.DOUBLE());
+      return seedsDS.flatMap((Long seed) -> trialReturns(seed, numTrials/parallelism, factorWeights, factorMeans, factorCov, spark).iterator(), Encoders.DOUBLE());
     }
 
     public static double fivePercentVaR(Dataset<Double> trials) {
         double[] quantiles = trials.stat().approxQuantile("value", new double[] {0.05}, 0.0);
-        return quantiles[0];
+        return quantiles.length!=0 ? quantiles[quantiles.length-1] : 0.0;
     }
     public static double fivePercentCVar(Dataset<Double> trials) {
         Dataset<Double> topLosses = trials.orderBy("value").limit(Math.max((int)(trials.count())/20, 1));
-        //topLosses.agg(sum)
-        return 0.0;
+        double sum =  (double)topLosses.agg(sum("value")).first().get(0);
+        return sum/topLosses.count();
+    }
+    public  static Tuple2<Double, Double> bootstrappedConfidenceInterval(Dataset<Double> trials, String riskType, int numResamples, double probability) {
+        List<Integer> range = new ArrayList<>();
+        for(int i=0; i<numResamples; ++i) {
+            range.add(i);
+        }
+       List<Double> stats =  range.stream().map(i -> {
+            Dataset<Double> resample = trials.sample(true, 1.0);
+            if(riskType.equals("var"))
+                return fivePercentVaR(resample);
+            else
+                return fivePercentCVar(resample);
+        }).collect(Collectors.toList());
+        Collections.sort(stats);
+        int lowerIndex = (int)(numResamples * probability / 2 -1);
+        int upperIndex = (int)(Math.ceil(numResamples * (1-probability)/2));
+        return new Tuple2<>(stats.get(lowerIndex), stats.get(upperIndex));
     }
 
+    public static int countFailures(List<List<Double>> stocksReturns, double valueAtRisk) {
+        int failures = 0;
+        List<Double> head = stocksReturns.get(0);
+        for(int i=0; i<head.size(); ++i) {
+            int finalI = i;
+            double loss = stocksReturns.stream().map(e -> e.get(finalI)).mapToDouble(j -> j).sum();
+            if(loss < valueAtRisk)
+                failures +=1;
+        }
+        return  failures;
+    }
+
+    public static double kupiecTestStatistic(int total, int failures, double confidenceLevel) {
+        double failureRatio = ((double) failures)/total;
+        double logNumer = (total - failures) * Math.log1p(-confidenceLevel) + failures * Math.log(confidenceLevel);
+        double logDenom = (total - failures) * Math.log1p(-failureRatio) + failures * Math.log(failureRatio);
+        return -2*(logNumer - logDenom);
+    }
+
+    public static double kupiecTestPValue(List<List<Double>> stocksReturns, double valueAtRisk, double confidenceLevel) {
+        int failures = countFailures(stocksReturns, valueAtRisk);
+        int total = stocksReturns.get(0).size();
+        double testStatistic = kupiecTestStatistic(total, failures, confidenceLevel);
+        return 1 - new ChiSquaredDistribution(1.0).cumulativeProbability(testStatistic);
+    }
 
 
     public static void main(String[] args) throws IOException {
         SparkSession sparkSession = SparkSession.builder().getOrCreate();
         Tuple2<List<List<Double>>, List<List<Double>>> stocksFactorsReturns = readStocksAndFactors();
-        int numTrials = 10000000;
-        int parallelism = 1000;
+        int numTrials = 100000;
+        int parallelism = 100;
         long baseSeed = 1001L;
         Dataset<Double> trials = computeTrialReturns(stocksFactorsReturns._1, stocksFactorsReturns._2, baseSeed, numTrials, parallelism, sparkSession);
 //       trials = trials.filter(not(isnan(trials.col("value"))));
+        trials.show();
         trials.cache();
         double valueAtRisk = fivePercentVaR(trials);
-        System.out.println(valueAtRisk);
+        double conditionalValueAtRisk = fivePercentCVar(trials);
+        System.out.println("VaR 5%: " + valueAtRisk);
+        System.out.println("CVaR 5%: " + conditionalValueAtRisk);
+//        Tuple2<Double, Double> varConfidenceInterval = bootstrappedConfidenceInterval(trials, "var", 100, 0.05);
+//        Tuple2<Double, Double> cvarConfidenceInterval = bootstrappedConfidenceInterval(trials, "cvar", 100, 0.05);
+//        System.out.println("VaR confidence interval: " + varConfidenceInterval);
+//        System.out.println("CVaR confidence interval: " + cvarConfidenceInterval);
+        System.out.println("Kupiec test p-value: " + kupiecTestPValue(stocksFactorsReturns._1, valueAtRisk, 0.05));
+
     }
 }
