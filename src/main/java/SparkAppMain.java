@@ -17,8 +17,15 @@ import org.apache.commons.math3.distribution.MultivariateNormalDistribution;
 
 import javax.xml.crypto.Data;
 
+import static org.apache.spark.sql.functions.*;
+
 public class SparkAppMain {
-    public static List<Tuple2<LocalDate, Double>> readGoogleHistory(File file) throws FileNotFoundException, IOException {
+    public static <T> void printNestedDoubleList(List<List<T>> list) {
+        for(List<T> l : list) {
+            System.out.println(list);
+        }
+    }
+    public static List<Tuple2<LocalDate, Double>> readHistory(File file) throws FileNotFoundException, IOException {
        // System.out.println("-----------------------------------");
      //   System.out.println(file.getName());
         DateTimeFormatter formatter = DateTimeFormatter.ofPattern("d-MMM-yy");
@@ -32,7 +39,7 @@ public class SparkAppMain {
             if(i==1) continue;
             lines.add(st);
         }
-        System.out.println("-----------------------------------");
+       // System.out.println("-----------------------------------");
         List<Tuple2<LocalDate, Double>> ret = new ArrayList<Tuple2<LocalDate, Double>>();
         for(String line : lines) {
             String[] cols = line.split(",");
@@ -89,11 +96,11 @@ public class SparkAppMain {
         LocalDate start = LocalDate.of(2009, 10, 23);
         LocalDate end = LocalDate.of(2014, 10, 23);
 
-        File stocksDir = new File("data/stocks/");
+        File stocksDir = new File("data/stocks_10percent/");
         List<File> files =  Arrays.asList(stocksDir.listFiles());
         List<List<Tuple2<LocalDate, Double>>> allStocks = new ArrayList<List<Tuple2<LocalDate, Double>>>();
         for(File f : files) {
-            allStocks.add(readGoogleHistory(f));
+            allStocks.add(readHistory(f));
         }
         allStocks.removeIf(ll -> ll.size() < 260 * 5 + 10);
         String factorsPrefix = "data/factors/";
@@ -104,8 +111,9 @@ public class SparkAppMain {
         }
         List<List<Tuple2<LocalDate, Double>>> rawFactors = new ArrayList<List<Tuple2<LocalDate, Double>>>();
         for(File f : factorFiles) {
-            rawFactors.add(readGoogleHistory(f));
+            rawFactors.add(readHistory(f));
         }
+
         List<List<Tuple2<LocalDate, Double>>> stocks = allStocks.stream().map(s -> trimToRegion(s, start, end)).map(s -> fillInHistory(s, start, end)).collect(Collectors.toList());
         List<List<Tuple2<LocalDate, Double>>> factors = rawFactors.stream().map(f -> trimToRegion(f, start, end)).map(f -> fillInHistory(f, start, end)).collect(Collectors.toList());
         List<List<Double>> stocksReturns = stocks.stream().map(SparkAppMain::twoWeekReturns).collect(Collectors.toList());
@@ -148,36 +156,54 @@ public class SparkAppMain {
     public static List<List<Double>> computeFactorWeights(List<List<Double>> stockReturns, List<List<Double>> factorFeatures) {
         return stockReturns.stream().map(s -> linearModel(s, factorFeatures)).map(s -> DoubleStream.of(s.estimateRegressionParameters()).boxed().collect(Collectors.toList())).collect(Collectors.toList());
     }
-    public static List<Double> trialReturns(Long seed, int numTrials, List<List<Double>> instruments, List<Double> factorMeans, double[][] factorCovariances) {
+    public static List<Double> trialReturns(Long seed, int numTrials, List<List<Double>> instruments, List<Double> factorMeans, double[][] factorCovariances, SparkSession spark) {
+       // System.out.println("------------------------TRIAL RETURNS-----------------------------");
         MersenneTwister rand = new MersenneTwister(seed);
         MultivariateNormalDistribution multivariateNormalDistribution = new MultivariateNormalDistribution(rand, factorMeans.stream().mapToDouble(d -> d).toArray(), factorCovariances);
         List<Double> tReturns = new ArrayList<Double>();
         for(int i=0; i<numTrials; ++i) {
            double[] trialFactorReturns = multivariateNormalDistribution.sample();
+           //System.out.println(Arrays.toString(trialFactorReturns));
            List<Double> trialFeatures = featurize(DoubleStream.of(trialFactorReturns).boxed().collect(Collectors.toList()));
+          // System.out.println(trialFeatures);
            tReturns.add(i, trialReturn(trialFeatures, instruments));
         }
+       // System.out.println(tReturns);
         return tReturns;
     }
     public static double trialReturn(List<Double> trial, List<List<Double>> instruments) {
+       // printNestedDoubleList(instruments);
+        //System.out.println("------------------------TRIAL RETURN-----------------------------");
         double totalReturn = 0.0;
         for(List<Double> instrument : instruments) {
-            totalReturn += instrumentTrialReturn(instrument, trial);
+            double itr = instrumentTrialReturn(instrument, trial);
+          //  System.out.println(itr);
+            if(!Double.isNaN(itr))
+                totalReturn += itr;
         }
+//        System.out.println(totalReturn);
         return totalReturn/instruments.size();
     }
     public static double instrumentTrialReturn(List<Double> instrument, List<Double> trial) {
+       // System.out.println("------------------------INSTRUMENT TRIAL RETURN-----------------------------");
         double itr = instrument.get(0);
         int i=0;
         while (i<trial.size()) {
             itr += trial.get(i) * instrument.get(i+1);
             ++i;
         }
+        //System.out.println(itr);
         return itr;
     }
     public static Dataset<Double> computeTrialReturns(List<List<Double>> stocksReturns, List<List<Double>> factorsReturns, Long baseSeed, int numTrials, int parallelism, SparkSession spark) {
         List<List<Double>> factorMat = factorMatrix(factorsReturns);
+//        System.out.println("----------------FACTOR MATRIX---------------------");
+//        printNestedDoubleList(factorMat);
        double[][] factorCov =  new Covariance(doubleNestedListto2DArray(factorMat)).getCovarianceMatrix().getData();
+//        System.out.println("----------------FACTOR COVARIANCE---------------------");
+//       for(double[] row : factorCov) {
+//           System.out.println(Arrays.toString(row));
+//       }
        List<Double> factorMeans = factorsReturns.stream().map(factor -> {
            double sum = 0.0;
            for(double f : factor) {
@@ -185,24 +211,36 @@ public class SparkAppMain {
            }
            return sum/factor.size();
        }).collect(Collectors.toList());
-       List<List<Double>> factorFeatures = factorMat.stream().map(el -> featurize(el)).collect(Collectors.toList());
+      //  System.out.println("----------------FACTOR MEANS---------------------");
+       // System.out.println(factorMeans);
+       List<List<Double>> factorFeatures = factorMat.stream().map(SparkAppMain::featurize).collect(Collectors.toList());
+        System.out.println("----------------FACTOR WEIGHTS--------------------");
+       // printNestedDoubleList(factorFeatures);
       List<List<Double>> factorWeights = computeFactorWeights(stocksReturns, factorFeatures);
       List<Long> seeds = new ArrayList<Long>();
       for(long i=baseSeed; i<=baseSeed + parallelism; ++i) {
           seeds.add(i);
       }
       Dataset<Long> seedsDS = spark.createDataset(seeds, Encoders.LONG()).repartition(parallelism);
-      return seedsDS.flatMap((FlatMapFunction<Long, Double>) seed -> trialReturns(seed, numTrials/parallelism, factorWeights, factorMeans, factorCov).iterator(), Encoders.DOUBLE());
+    //  seedsDS.show();
+//        for(long seed: seeds){
+//            trialReturns(seed, numTrials/parallelism, factorWeights, factorMeans, factorCov, spark);
+//        }
+      return seedsDS.flatMap((Long seed) -> trialReturns(seed, 10000, factorWeights, factorMeans, factorCov, spark).iterator(), Encoders.DOUBLE());
     }
 
     public static double fivePercentVaR(Dataset<Double> trials) {
         double[] quantiles = trials.stat().approxQuantile("value", new double[] {0.05}, 0.0);
         return quantiles[0];
     }
-//    public static double fivePercentCVar(Dataset<Double> trials) {
-//        Dataset<Double> topLosses = trials.orderBy("value").limit(Math.max((int)(trials.count())/20, 1));
-//
-//    }
+    public static double fivePercentCVar(Dataset<Double> trials) {
+        Dataset<Double> topLosses = trials.orderBy("value").limit(Math.max((int)(trials.count())/20, 1));
+        //topLosses.agg(sum)
+        return 0.0;
+    }
+
+
+
     public static void main(String[] args) throws IOException {
         SparkSession sparkSession = SparkSession.builder().getOrCreate();
         Tuple2<List<List<Double>>, List<List<Double>>> stocksFactorsReturns = readStocksAndFactors();
@@ -210,6 +248,9 @@ public class SparkAppMain {
         int parallelism = 1000;
         long baseSeed = 1001L;
         Dataset<Double> trials = computeTrialReturns(stocksFactorsReturns._1, stocksFactorsReturns._2, baseSeed, numTrials, parallelism, sparkSession);
-        trials.show();
+//       trials = trials.filter(not(isnan(trials.col("value"))));
+        trials.cache();
+        double valueAtRisk = fivePercentVaR(trials);
+        System.out.println(valueAtRisk);
     }
 }
