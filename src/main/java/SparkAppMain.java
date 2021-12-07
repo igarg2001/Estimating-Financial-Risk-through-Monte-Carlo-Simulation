@@ -15,15 +15,12 @@ import java.util.stream.Stream;
 import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression;
 import org.apache.commons.math3.random.MersenneTwister;
 import org.apache.commons.math3.distribution.MultivariateNormalDistribution;
-
-import javax.xml.crypto.Data;
-
 import static org.apache.spark.sql.functions.*;
 
 public class SparkAppMain {
     public static <T> void printNestedDoubleList(List<List<T>> list) {
         for(List<T> l : list) {
-            System.out.println(list);
+            System.out.println(l);
         }
     }
     public static List<Tuple2<LocalDate, Double>> readHistory(File file) throws FileNotFoundException, IOException {
@@ -83,21 +80,22 @@ public class SparkAppMain {
        // System.out.println(history.size());
         List<Double> ret = new ArrayList<Double>();
         int i=0;
-        while(i<= history.size()-1 && (i+9)<=history.size()-1) {
-            List<Tuple2<LocalDate, Double>> subList = history.subList(i, i+9);
+        while(i<= history.size()-1 && (i+10)<=history.size()) {
+            List<Tuple2<LocalDate, Double>> subList = history.subList(i, i+10);
             double next = subList.get(subList.size()-1)._2;
             double prev = subList.get(0)._2;
-            double elem = (next-prev)/prev;
+            double elem = (next-prev);
             ret.add(elem);
-            i+=9;
+            i++;
         }
+//        System.out.println(ret);
         return ret;
     }
     public static Tuple2<List<List<Double>>, List<List<Double>>> readStocksAndFactors() throws IOException {
         LocalDate start = LocalDate.of(2009, 10, 23);
         LocalDate end = LocalDate.of(2014, 10, 23);
 
-        File stocksDir = new File("data/stocks_10percent/");
+        File stocksDir = new File("data/stocks/");
         List<File> files =  Arrays.asList(stocksDir.listFiles());
         List<List<Tuple2<LocalDate, Double>>> allStocks = new ArrayList<List<Tuple2<LocalDate, Double>>>();
         for(File f : files) {
@@ -121,7 +119,6 @@ public class SparkAppMain {
         List<List<Double>> factorsReturns = factors.stream().map(SparkAppMain::twoWeekReturns).collect(Collectors.toList());
         return new Tuple2<List<List<Double>>, List<List<Double>>>(stocksReturns, factorsReturns);
     }
-
     public static List<List<Double>> factorMatrix(List<List<Double>> histories) {
         List<List<Double>> mat = new ArrayList<List<Double>>();
         List<Double> head = histories.get(0);
@@ -234,7 +231,6 @@ public class SparkAppMain {
 //        }
       return seedsDS.flatMap((Long seed) -> trialReturns(seed, numTrials/parallelism, factorWeights, factorMeans, factorCov, spark).iterator(), Encoders.DOUBLE());
     }
-
     public static double fivePercentVaR(Dataset<Double> trials) {
         double[] quantiles = trials.stat().approxQuantile("value", new double[] {0.05}, 0.0);
         return quantiles.length!=0 ? quantiles[quantiles.length-1] : 0.0;
@@ -261,7 +257,6 @@ public class SparkAppMain {
         int upperIndex = (int)(Math.ceil(numResamples * (1-probability)/2));
         return new Tuple2<>(stats.get(lowerIndex), stats.get(upperIndex));
     }
-
     public static int countFailures(List<List<Double>> stocksReturns, double valueAtRisk) {
         int failures = 0;
         List<Double> head = stocksReturns.get(0);
@@ -286,6 +281,7 @@ public class SparkAppMain {
         int total = stocksReturns.get(0).size();
         double testStatistic = kupiecTestStatistic(total, failures, confidenceLevel);
         return 1 - new ChiSquaredDistribution(1.0).cumulativeProbability(testStatistic);
+//        return testStatistic;
     }
 
 
@@ -297,7 +293,7 @@ public class SparkAppMain {
         long baseSeed = 1001L;
         Dataset<Double> trials = computeTrialReturns(stocksFactorsReturns._1, stocksFactorsReturns._2, baseSeed, numTrials, parallelism, sparkSession);
 //       trials = trials.filter(not(isnan(trials.col("value"))));
-        trials.show();
+//        trials.show();
         trials.cache();
         double valueAtRisk = fivePercentVaR(trials);
         double conditionalValueAtRisk = fivePercentCVar(trials);
@@ -308,6 +304,5 @@ public class SparkAppMain {
 //        System.out.println("VaR confidence interval: " + varConfidenceInterval);
 //        System.out.println("CVaR confidence interval: " + cvarConfidenceInterval);
         System.out.println("Kupiec test p-value: " + kupiecTestPValue(stocksFactorsReturns._1, valueAtRisk, 0.05));
-
     }
 }
